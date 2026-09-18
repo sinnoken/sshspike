@@ -1,0 +1,179 @@
+name: ci
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A new push cancels an in-flight run for the same branch.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GO_VERSION: '1.22'
+
+jobs:
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: go.mod is tidy
+        run: |
+          cp go.mod go.mod.bak
+          cp go.sum go.sum.bak 2>/dev/null || true
+          go mod tidy
+          if ! diff -q go.mod go.mod.bak > /dev/null; then
+            echo "::error::go.mod is not tidy; run 'go mod tidy' and commit"
+            diff go.mod.bak go.mod || true
+            exit 1
+          fi
+          rm -f go.mod.bak go.sum.bak
+
+      - name: gofmt
+        run: |
+          out=$(gofmt -l .)
+          if [ -n "$out" ]; then
+            echo "::error::these files need gofmt:"
+            echo "$out"
+            exit 1
+          fi
+          echo "gofmt: clean"
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: test
+        run: go test -count=1 ./...
+
+      - name: test with race detector
+        run: go test -race -count=1 ./...
+
+      # The console shares one connection pool across concurrent HTTP handlers,
+      # so a data race here would be a real bug, not a test artefact.
+      - name: coverage
+        run: |
+          go test -coverprofile=coverage.out ./...
+          go tool cover -func=coverage.out | tail -1
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage
+          path: coverage.out
+          retention-days: 7
+
+  vuln:
+    name: vulnerability scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - run: go install golang.org/x/vuln/cmd/govulncheck@latest
+      - run: govulncheck ./...
+
+  build:
+    name: build ${{ matrix.goos }}/${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: darwin
+            goarch: arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      # CGO_ENABLED=0 is what keeps this a single portable binary.
+      - name: build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: '0'
+        run: |
+          go build -trimpath \
+            -ldflags "-s -w" \
+            -o "sshspike-${GOOS}-${GOARCH}" .
+          ls -lh "sshspike-${GOOS}-${GOARCH}"
+
+      # Only the native binary can actually be executed on the runner.
+      - name: smoke test
+        if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
+        run: |
+          set -euo pipefail
+
+          # Start with host key checking disabled and no agent: the console
+          # must still come up and report the degraded state rather than crash.
+          ./sshspike-linux-amd64 -insecure-host-key -listen 127.0.0.1:18080 &
+          pid=$!
+          trap 'kill $pid 2>/dev/null || true' EXIT
+
+          for i in $(seq 1 20); do
+            if curl -sf -o /dev/null http://127.0.0.1:18080/; then break; fi
+            if [ "$i" = 20 ]; then echo "::error::console never became ready"; exit 1; fi
+            sleep 0.25
+          done
+
+          echo "--- index page"
+          curl -sf http://127.0.0.1:18080/ | grep -q "ssh spike" \
+            && echo "index: ok"
+
+          echo "--- /api/conns (pool starts empty)"
+          curl -sf http://127.0.0.1:18080/api/conns | tee /dev/stderr | grep -q '"connections"'
+
+          echo "--- /api/identities (no agent in CI, expect a clean error)"
+          code=$(curl -s -o /tmp/ids.json -w '%{http_code}' http://127.0.0.1:18080/api/identities)
+          cat /tmp/ids.json
+          if [ "$code" != "503" ]; then
+            echo "::error::expected 503 without SSH_AUTH_SOCK, got $code"; exit 1
+          fi
+
+          echo "--- /api/run rejects a missing host"
+          code=$(curl -s -o /tmp/run.json -w '%{http_code}' \
+            -X POST -H 'Content-Type: application/json' \
+            -d '{"command":"echo hi"}' http://127.0.0.1:18080/api/run)
+          cat /tmp/run.json
+          if [ "$code" != "400" ]; then
+            echo "::error::expected 400 for a missing host, got $code"; exit 1
+          fi
+
+          echo "--- /api/run rejects GET"
+          code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:18080/api/run)
+          if [ "$code" != "405" ]; then
+            echo "::error::expected 405 for GET, got $code"; exit 1
+          fi
+
+          echo "smoke test: all checks passed"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sshspike-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: sshspike-${{ matrix.goos }}-${{ matrix.goarch }}
+          retention-days: 14

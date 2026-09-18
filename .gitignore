@@ -1,0 +1,4 @@
+/sshspike
+/sshspike-*
+/dist/
+coverage.out
