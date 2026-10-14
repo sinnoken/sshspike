@@ -1,12 +1,15 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"golang.org/x/crypto/ssh"
 )
@@ -260,5 +263,75 @@ func TestPoolConcurrentAccess(t *testing.T) {
 	s.pool.CloseAll()
 	if got := len(s.pool.list()); got != 0 {
 		t.Fatalf("pool should be empty after CloseAll, got %d", got)
+	}
+}
+
+func TestRunRejectsInvalidTarget(t *testing.T) {
+	s := newTestServer()
+	for _, body := range []string{
+		`{"host":"","command":"true"}`,
+		`{"host":"-oProxyCommand=x","command":"true"}`,
+		`{"host":"a b","command":"true"}`,
+		`{"host":"127.0.0.1","port":70000,"command":"true"}`,
+		`{"host":"127.0.0.1","port":-1,"command":"true"}`,
+		`{"host":"127.0.0.1","command":"  "}`,
+	} {
+		if w := post(t, s, "/api/run", body); w.Code != http.StatusBadRequest {
+			t.Errorf("%s: status = %d, want 400", body, w.Code)
+		}
+	}
+}
+
+func TestCloseRejectsInvalidTarget(t *testing.T) {
+	s := newTestServer()
+	for _, body := range []string{`{"host":""}`, `{"host":"h","port":99999}`} {
+		if w := post(t, s, "/api/close", body); w.Code != http.StatusBadRequest {
+			t.Errorf("%s: status = %d, want 400", body, w.Code)
+		}
+	}
+}
+
+func TestPoolEvictsStaleConnection(t *testing.T) {
+	pings := 0
+	p := &Pool{
+		verify:     ssh.InsecureIgnoreHostKey(),
+		healthIdle: time.Millisecond,
+		ping:       func(*ssh.Client) error { pings++; return errors.New("dead") },
+	}
+	k := key("u", "127.0.0.1", 1)
+	p.conns = map[string]*Conn{k: {lastUsed: time.Now().Add(-time.Hour)}}
+
+	t.Setenv("SSH_AUTH_SOCK", "") // redial fails fast, which is fine here
+	if _, _, err := p.get(context.Background(), "u", "127.0.0.1", 1); err == nil {
+		t.Fatal("expected redial failure without an agent")
+	}
+	if pings != 1 {
+		t.Errorf("pings = %d, want 1", pings)
+	}
+	if len(p.list()) != 0 {
+		t.Error("stale connection must be evicted")
+	}
+}
+
+func TestPoolReusesHealthyAndRecentConnections(t *testing.T) {
+	pings := 0
+	p := &Pool{
+		healthIdle: time.Hour,
+		ping:       func(*ssh.Client) error { pings++; return nil },
+	}
+	k := key("u", "h", 22)
+	c := &Conn{lastUsed: time.Now()}
+	p.conns = map[string]*Conn{k: c}
+
+	got, reused, err := p.get(context.Background(), "u", "h", 22)
+	if err != nil || !reused || got != c || pings != 0 {
+		t.Fatalf("recent conn: got=%v reused=%v err=%v pings=%d", got == c, reused, err, pings)
+	}
+
+	p.healthIdle = time.Millisecond
+	c.lastUsed = time.Now().Add(-time.Hour)
+	got, reused, err = p.get(context.Background(), "u", "h", 22)
+	if err != nil || !reused || got != c || pings != 1 {
+		t.Fatalf("healthy idle conn: reused=%v err=%v pings=%d", reused, err, pings)
 	}
 }
